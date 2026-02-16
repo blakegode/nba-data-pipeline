@@ -5,7 +5,7 @@
 *.tfstate.*.backup
 .terraform.lock.hcl
 
-# Secrets — never commit these
+# Secrets
 terraform.tfvars
 
 # Lambda build artifacts

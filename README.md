@@ -1,130 +1,105 @@
 # NBA Daily Data Pipeline
 
-A serverless data pipeline on AWS that fetches daily NBA game results and stores them in a secure, cost-optimized S3 data lake — fully deployed with Terraform.
+A serverless, event-driven data pipeline on AWS that ingests daily NBA game results into a secure, cost-optimized S3 data lake. All infrastructure is defined as code with Terraform.
 
-**Skills demonstrated:** AWS Lambda, S3, EventBridge, SSM Parameter Store, IAM, CloudWatch, SNS, Terraform (IaC), Python, API integration, cloud security, cost optimization
-
-## Architecture
+## Architecture Overview
 
 ```
-EventBridge (daily cron)
-       │
-       ▼
-Lambda (Python 3.12)  ──▸  SSM Parameter Store (API key)
-       │
-       ▼
-BallDontLie API (/v1/games)
-       │
-       ▼
-S3 Bucket (SSE-KMS, versioned, lifecycle)
-  └── games/YYYY/MM/DD/games.json
+┌──────────────────────────────────────────────────────────────────┐
+│  AWS Cloud                                                       │
+│                                                                  │
+│  ┌─────────────┐    ┌─────────────────────────────────────────┐  │
+│  │ EventBridge │    │         Lambda (Python 3.12)            │  │
+│  │ (daily cron)│───▸│                                         │  │
+│  └─────────────┘    │  1. Retrieve API key from SSM           │  │
+│                     │  2. Call BallDontLie API                 │  │
+│                     │  3. Write JSON to S3                     │  │
+│                     └────┬──────────┬──────────┬──────────────┘  │
+│                          │          │          │                  │
+│                     ┌────▼───┐ ┌────▼───┐ ┌───▼──────────────┐  │
+│                     │  SSM   │ │   S3   │ │ CloudWatch Logs  │  │
+│                     │ Param  │ │  Data  │ │ (30-day retain)  │  │
+│                     │ Store  │ │  Lake  │ └───┬──────────────┘  │
+│                     │ (KMS)  │ │ (KMS)  │     │                  │
+│                     └────────┘ └────────┘ ┌───▼──────────────┐  │
+│                                           │ CloudWatch Alarm │  │
+│  ┌──────────────────┐                     │   (error >= 1)   │  │
+│  │  BallDontLie API │                     └───┬──────────────┘  │
+│  │ (external, HTTPS)│                         │                  │
+│  └──────────────────┘                     ┌───▼──────────────┐  │
+│                                           │   SNS (email)    │  │
+│                                           └──────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-**How it works:**
+## Data Flow
 
-1. **EventBridge** fires a cron rule daily at 8:00 AM UTC
-2. **Lambda** retrieves the API key from **SSM Parameter Store** (SecureString) and fetches yesterday's NBA game results from the [BallDontLie API](https://www.balldontlie.io/)
-3. Game data is written as JSON to **S3** at a date-partitioned key path (`games/YYYY/MM/DD/games.json`)
-4. Execution is logged to **CloudWatch Logs** with 30-day retention
+1. **Trigger** — EventBridge fires a cron rule daily at 8:00 AM UTC.
+2. **Credential Retrieval** — Lambda fetches the API key from SSM Parameter Store, which decrypts the SecureString value via KMS at runtime.
+3. **Data Ingestion** — Lambda calls the [BallDontLie API](https://www.balldontlie.io/) (`/v1/games`) over HTTPS for yesterday's game results.
+4. **Storage** — Game data is serialized as JSON and written to S3 at a date-partitioned key path:
+   ```
+   games/YYYY/MM/DD/games.json
+   ```
+5. **Observability** — Every execution is logged to CloudWatch Logs (30-day retention). If the Lambda errors, a CloudWatch Alarm triggers an SNS email notification.
 
-## Security
+## Security Architecture
 
-- API key stored in **SSM Parameter Store** (SecureString, KMS-encrypted) — never in source code or environment variables
-- Lambda IAM role follows **least-privilege**: can only write to one S3 bucket and read one SSM parameter
-- S3 bucket is **encrypted at rest** (SSE-KMS), **versioned**, and **blocks all public access**
-- `terraform.tfvars` and state files are excluded via `.gitignore`
+| Layer | Mechanism | Detail |
+|---|---|---|
+| **Secrets** | SSM Parameter Store (SecureString) | API key encrypted at rest with KMS — never in source code or env vars |
+| **IAM** | Least-privilege Lambda role | Can only `s3:PutObject` to one bucket and `ssm:GetParameter` for one parameter |
+| **Data at rest** | SSE-KMS with bucket key | All S3 objects encrypted; bucket key reduces KMS API call costs by ~99% |
+| **Data in transit** | HTTPS | All external API calls and AWS SDK calls use TLS |
+| **Access control** | S3 Block Public Access | All four block-public-access settings enabled |
+| **Versioning** | S3 versioning | Protects against accidental overwrites or deletions |
+| **Source control** | `.gitignore` | `terraform.tfvars`, state files, and build artifacts excluded from git |
 
-## Cost
+## Infrastructure as Code
 
-| Resource | Estimated Monthly Cost |
-|---|---|
-| Lambda | $0.00 (free tier) |
-| S3 | $0.00 (free tier) |
-| SSM Parameter Store | $0.00 (free for standard params) |
-| CloudWatch Logs | $0.00 (free tier) |
-| SNS | $0.00 (free tier) |
-| EventBridge | $0.00 (always free) |
-
-Objects transition to **Glacier** after 90 days to reduce long-term storage costs.
-
-## Project Structure
+The entire stack is defined in **~250 lines of Terraform HCL** across modular files:
 
 ```
-├── main.tf                    # Provider config, version constraints, default tags
-├── variables.tf               # Input variables with types and defaults
-├── outputs.tf                 # Deployment output values
-├── s3.tf                      # S3 bucket + encryption + versioning + lifecycle
-├── lambda.tf                  # Lambda function + IAM role/policy + CloudWatch logs
-├── eventbridge.tf             # Scheduled rule + target + Lambda permission
-├── secrets.tf                 # SSM Parameter Store (SecureString) for the API key
-├── cloudwatch.tf              # CloudWatch alarm + SNS topic for error alerts
-├── terraform.tfvars.example   # Template — copy to terraform.tfvars and add your API key
-├── .gitignore                 # Excludes secrets, state files, build artifacts
+├── main.tf              # AWS provider, version constraints (>= 1.5), default tags
+├── variables.tf         # Input variables: region, schedule, Lambda config, API key (sensitive)
+├── outputs.tf           # Exported resource identifiers (ARNs, bucket name)
+│
+├── s3.tf                # S3 bucket, SSE-KMS encryption, versioning, Glacier lifecycle
+├── lambda.tf            # Lambda function, IAM role + policy, CloudWatch log group
+├── eventbridge.tf       # Scheduled rule (cron), Lambda target, invoke permission
+├── secrets.tf           # SSM Parameter Store entry (SecureString)
+├── cloudwatch.tf        # CloudWatch alarm + SNS topic + email subscription
+│
 └── lambda/
-    └── handler.py             # Python Lambda function (fetch API + upload to S3)
+    └── handler.py       # Python function: fetch API → transform → upload to S3
 ```
 
-## Setup & Deployment
+Lambda packaging is handled automatically — Terraform's `archive_file` data source zips `handler.py` at plan time, so there is no external build step.
 
-### Prerequisites
+## Key Design Decisions
 
-- AWS account with CLI configured (`aws configure`)
-- Terraform >= 1.5
-- BallDontLie API key ([app.balldontlie.io](https://app.balldontlie.io))
+| Decision | Alternative Considered | Rationale |
+|---|---|---|
+| **Terraform** | CloudFormation | Cloud-agnostic, cleaner HCL syntax, stronger ecosystem and module registry |
+| **SSM Parameter Store** | Environment variables, Secrets Manager | KMS-encrypted SecureString at no cost (standard tier); avoids plaintext secrets |
+| **`urllib` (stdlib)** | `requests` library | Zero external dependencies — no Lambda layer, no packaging complexity, minimal cold start |
+| **Date-partitioned S3 keys** | Flat key structure | Enables partition pruning with Athena/Glue without full-bucket scans |
+| **KMS with bucket key** | SSE-S3 | Stronger key management with reduced per-object KMS API costs |
+| **128 MB / 30s Lambda** | Higher memory | Workload is I/O-bound (one API call + one S3 put); minimal compute needed |
 
-### Deploy
+## Cost Optimization
 
-```bash
-git clone https://github.com/YOUR_USERNAME/nba-data-pipeline.git
-cd nba-data-pipeline
+The pipeline runs entirely within the **AWS Free Tier** at $0.00/month:
 
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — paste in your API key
-
-terraform init
-terraform plan
-terraform apply
-```
-
-### Test
-
-```bash
-aws lambda invoke --function-name nba-data-pipeline-fetcher --payload '{}' response.json
-cat response.json
-```
-
-Example output:
-```json
-{
-  "date": "2026-02-12",
-  "games_found": 3,
-  "s3_key": "games/2026/02/12/games.json",
-  "games": [
-    {"matchup": "Milwaukee Bucks @ Oklahoma City Thunder", "score": "110 - 93", "status": "Final"},
-    {"matchup": "Portland Trail Blazers @ Utah Jazz", "score": "135 - 119", "status": "Final"},
-    {"matchup": "Dallas Mavericks @ Los Angeles Lakers", "score": "104 - 124", "status": "Final"}
-  ]
-}
-```
-
-### Teardown
-
-```bash
-aws s3 rm s3://nba-data-lake-YOUR_ACCOUNT_ID --recursive
-terraform destroy
-```
-
-## Design Decisions
-
-- **Terraform over CloudFormation** — cloud-agnostic, cleaner HCL syntax, widely adopted in industry
-- **SSM Parameter Store over env vars** — SecureString encrypted with KMS, free for standard parameters, no secrets in plaintext
-- **`urllib` over `requests`** — no external dependencies, no Lambda layer needed, minimal cold start
-- **Date-partitioned S3 keys** — enables efficient querying with Athena without full bucket scans
-- **KMS with bucket key** — strong encryption with reduced API call costs
+- **Lambda** — 1 invocation/day is well within 1M free invocations
+- **S3** — Daily JSON files (~2 KB each) are negligible against the 5 GB free tier
+- **Glacier lifecycle** — Objects automatically transition after 90 days, reducing long-term storage costs by ~94%
+- **KMS bucket key** — Reduces encryption API calls from per-object to per-bucket, cutting KMS costs by ~99%
+- **EventBridge, SSM, SNS, CloudWatch** — All free at this usage level
 
 ## Future Enhancements
 
-- Athena integration for SQL queries on game data
-- CI/CD pipeline with GitHub Actions
-- Player statistics collection
-- Daily score summary via SNS (email/SMS)
+- **Athena integration** — SQL queries over the date-partitioned data lake
+- **CI/CD pipeline** — GitHub Actions for `terraform plan` on PR, `terraform apply` on merge
+- **Player statistics** — Expand ingestion to player-level box scores
+- **Daily digest** — SNS-based email/SMS summary of scores
